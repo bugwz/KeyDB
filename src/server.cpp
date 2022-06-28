@@ -3174,6 +3174,7 @@ void createSharedObjects(void) {
     shared.maxstring = sdsnew("maxstring");
 }
 
+// 初始化master的一些信息
 void initMasterInfo(redisMaster *master)
 {
     if (cserver.default_masterauth)
@@ -3578,6 +3579,8 @@ void adjustOpenFilesLimit(void) {
 
 /* Check that g_pserver->tcp_backlog can be actually enforced in Linux according
  * to the value of /proc/sys/net/core/somaxconn, or warn about it. */
+// 根据/proc/sys/net/core/somaxconn的值，检查 g_pserver->tcp_backlog 
+// 是否可以在Linux中实际执行，或者对此发出警告。
 void checkTcpBacklogSettings(void) {
 #ifdef HAVE_PROC_SOMAXCONN
     FILE *fp = fopen("/proc/sys/net/core/somaxconn","r");
@@ -3639,6 +3642,8 @@ int createSocketAcceptHandler(socketFds *sfd, aeFileProc *accept_handler) {
  * impossible to bind, or no bind addresses were specified in the server
  * configuration but the function is not able to bind * for at least
  * one of the IPv4 or IPv6 protocols. */
+// 当开启多worker线程的时候， fReusePort 为1
+// fFirstListen 指的是当前监听的线程是否为主线程，1代表为主线程
 int listenToPort(int port, socketFds *sfd, int fReusePort, int fFirstListen) {
     int j;
     const char **bindaddr = (const char**)g_pserver->bindaddr;
@@ -3646,6 +3651,7 @@ int listenToPort(int port, socketFds *sfd, int fReusePort, int fFirstListen) {
     const char *default_bindaddr[2] = {"*", "-::*"};
 
     /* Force binding of 0.0.0.0 if no bind address is specified. */
+    // 如果没有网卡地址可用则强制绑定0.0.0.0
     if (g_pserver->bindaddr_count == 0) {
         bindaddr_count = 2;
         bindaddr = default_bindaddr;
@@ -3657,9 +3663,13 @@ int listenToPort(int port, socketFds *sfd, int fReusePort, int fFirstListen) {
         if (optional) addr++;
         if (strchr(addr,':')) {
             /* Bind IPv6 address. */
+            // 绑定ipv6的地址
+            // 当前为主线程的时候，fReusePort 为 1， fFirstListen 为 1
             sfd->fd[sfd->count] = anetTcp6Server(serverTL->neterr,port,addr,g_pserver->tcp_backlog,fReusePort,fFirstListen);
         } else {
             /* Bind IPv4 address. */
+            // 绑定ipv4的地址
+            // 当前为主线程的时候，fReusePort 为 1， fFirstListen 为 1
             sfd->fd[sfd->count] = anetTcpServer(serverTL->neterr,port,addr,g_pserver->tcp_backlog,fReusePort,fFirstListen);
         }
         if (sfd->fd[sfd->count] == ANET_ERR) {
@@ -3738,9 +3748,11 @@ void makeThreadKillable(void) {
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 }
 
+// 多work线程的情况下， fReusePort 为1
 static void initNetworkingThread(int iel, int fReusePort)
 {
     /* Open the TCP listening socket for the user commands. */
+    // 需要使用 reuseport 或者 当前的线程为第一个线程（主线程）
     if (fReusePort || (iel == IDX_EVENT_LOOP_MAIN))
     {
         if (g_pserver->port != 0 &&
@@ -3748,6 +3760,7 @@ static void initNetworkingThread(int iel, int fReusePort)
             serverLog(LL_WARNING, "Failed listening on port %u (TCP), aborting.", g_pserver->port);
             exit(1);
         }
+        // 如果开启了tls，则需要监听一个tls端口
         if (g_pserver->tls_port != 0 &&
             listenToPort(g_pserver->tls_port,&g_pserver->rgthreadvar[iel].tlsfd, fReusePort, (iel == IDX_EVENT_LOOP_MAIN)) == C_ERR) {
             serverLog(LL_WARNING, "Failed listening on port %u (TLS), aborting.", g_pserver->port);
@@ -3756,13 +3769,16 @@ static void initNetworkingThread(int iel, int fReusePort)
     }
     else
     {
+        // 如果没有开启 reuseport 并且 没有启用多worker线程
         // We use the main threads file descriptors
         memcpy(&g_pserver->rgthreadvar[iel].ipfd, &g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].ipfd, sizeof(socketFds));
         g_pserver->rgthreadvar[iel].ipfd.count = g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].ipfd.count;
     }
 
     /* Create an event handler for accepting new connections in TCP */
+    // 创建事件处理程序以接受TCP中的新连接
     for (int j = 0; j < g_pserver->rgthreadvar[iel].ipfd.count; j++) {
+        // TODO: 需要重点关注 acceptTcpHandler 在多worker线程时的表现行为
         if (aeCreateFileEvent(g_pserver->rgthreadvar[iel].el, g_pserver->rgthreadvar[iel].ipfd.fd[j], AE_READABLE|AE_READ_THREADSAFE,
             acceptTcpHandler,NULL) == AE_ERR)
             {
@@ -3773,6 +3789,7 @@ static void initNetworkingThread(int iel, int fReusePort)
 
     makeThreadKillable();
 
+    // 当启用了tls的情况下，需要设置一下tls连接的处理函数 acceptTLSHandler
     for (int j = 0; j < g_pserver->rgthreadvar[iel].tlsfd.count; j++) {
         if (aeCreateFileEvent(g_pserver->rgthreadvar[iel].el, g_pserver->rgthreadvar[iel].tlsfd.fd[j], AE_READABLE|AE_READ_THREADSAFE,
             acceptTLSHandler,NULL) == AE_ERR)
@@ -3783,10 +3800,12 @@ static void initNetworkingThread(int iel, int fReusePort)
     }
 }
 
+// 重中之重，多线程的情况下传入参数 fReusePort 为1
 static void initNetworking(int fReusePort)
 {
     // We only initialize the main thread here, since RDB load is a special case that processes
     //  clients before our server threads are launched.
+    // 这里我们只初始化主线程，因为RDB加载是在启动服务器线程之前处理客户端的一种特殊情况。
     initNetworkingThread(IDX_EVENT_LOOP_MAIN, fReusePort);
 
     /* Open the listening Unix domain socket. */
@@ -3829,13 +3848,18 @@ static void initServerThread(struct redisServerThreadVars *pvar, int fMain)
             strerror(errno));
         exit(1);
     }
+
+    // 设置处理函数
     aeSetBeforeSleepProc(pvar->el, beforeSleep, AE_SLEEP_THREADSAFE);
     aeSetAfterSleepProc(pvar->el, afterSleep, AE_SLEEP_THREADSAFE);
 
     fastlock_init(&pvar->lockPendingWrite, "lockPendingWrite");
 
+    // 如果不是主线程
     if (!fMain)
     {
+        // 创建轻量的 severCronList 函数
+        // TODO: serverCronLite 与 serverCron 的区别是？
         if (aeCreateTimeEvent(pvar->el, 1, serverCronLite, NULL, NULL) == AE_ERR) {
             serverPanic("Can't create event loop timers.");
             exit(1);
@@ -3844,6 +3868,7 @@ static void initServerThread(struct redisServerThreadVars *pvar, int fMain)
 
     /* Register a readable event for the pipe used to awake the event loop
      * when a blocked client in a module needs attention. */
+    // 为管道注册一个可读事件，用于在模块中被阻止的客户端需要注意时唤醒事件循环。
     if (aeCreateFileEvent(pvar->el, g_pserver->module_blocked_pipe[0], AE_READABLE,
         moduleBlockedClientPipeReadable,NULL) == AE_ERR) {
             serverPanic(
@@ -4070,8 +4095,10 @@ void initServer(void) {
 void InitServerLast() {
     bioInit();
     set_jemalloc_bg_thread(cserver.jemalloc_bg_thread);
+    // 记录初始的内存容量信息
     g_pserver->initial_memory_usage = zmalloc_used_memory();
 
+    // TODO: 创建与线程数一致的异步处理队列
     g_pserver->asyncworkqueue = new (MALLOC_LOCAL) AsyncWorkQueue(cserver.cthreads);
 
     // Allocate the repl backlog
@@ -4711,7 +4738,10 @@ static int cmdHasMovableKeys(struct redisCommand *cmd) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c, int callFlags) {
+    // 判断当前客户端是否应该在当前线程执行
     AssertCorrectThread(c);
+
+    // 执行命令前，判断命令需要为异步执行的 或者 已经获取了全局锁
     serverAssert((callFlags & CMD_CALL_ASYNC) || GlobalLocksAcquired());
     if (!g_pserver->lua_timedout) {
         /* Both EXEC and EVAL call call() directly so there should be
@@ -4723,6 +4753,7 @@ int processCommand(client *c, int callFlags) {
         serverAssert(!serverTL->in_eval);
     }
 
+    // 是否为module的指令，如果是，直接走掉用module函数的逻辑
     if (moduleHasCommandFilters())
     {
         moduleCallCommandFilters(c);
@@ -4740,6 +4771,7 @@ int processCommand(client *c, int callFlags) {
 
     /* Now lookup the command and check ASAP about trivial error conditions
      * such as wrong arity, bad command name and so forth. */
+    // 查找对应的命令
     c->cmd = c->lastcmd = lookupCommand((sds)ptrFromObj(c->argv[0]));
     if (!c->cmd) {
         sds args = sdsempty();
@@ -4770,9 +4802,11 @@ int processCommand(client *c, int callFlags) {
     int is_may_replicate_command = (c->cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE)) ||
                                    (c->cmd->proc == execCommand && (c->mstate.cmd_flags & (CMD_WRITE | CMD_MAY_REPLICATE)));
 
+    // 是否需要认证
     if (authRequired(c)) {
         /* AUTH and HELLO and no auth commands are valid even in
          * non-authenticated state. */
+        // 拒绝没有认证的请求
         if (!(c->cmd->flags & CMD_NO_AUTH)) {
             rejectCommand(c,shared.noautherr);
             return C_OK;
@@ -4781,6 +4815,7 @@ int processCommand(client *c, int callFlags) {
 
     /* Check if the user can run this command according to the current
      * ACLs. */
+    // 检查acl限制
     int acl_errpos;
     int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
     if (acl_retval != ACL_OK) {
@@ -4812,6 +4847,7 @@ int processCommand(client *c, int callFlags) {
      * However we don't perform the redirection if:
      * 1) The sender of this command is our master.
      * 2) The command has no key arguments. */
+    // 在集群模式下检查key的归属问题
     if (g_pserver->cluster_enabled &&
         !(c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_LUA &&
@@ -4841,6 +4877,7 @@ int processCommand(client *c, int callFlags) {
      * the event loop since there is a busy Lua script running in timeout
      * condition, to avoid mixing the propagation of scripts with the
      * propagation of DELs due to eviction. */
+    // 检查内存是否超限
     if (g_pserver->maxmemory && !g_pserver->lua_timedout && !(callFlags & CMD_CALL_ASYNC)) {
         int out_of_memory = (performEvictions(false /*fPreSnapshot*/) == EVICT_FAIL);
         /* freeMemoryIfNeeded may flush replica output buffers. This may result
@@ -4880,6 +4917,7 @@ int processCommand(client *c, int callFlags) {
     
     /* Don't accept write commands if there are problems persisting on disk
         * and if this is a master instance. */
+    // 当写磁盘出现错误的时候，需要禁止写请求
     int deny_write_type = writeCommandsDeniedByDiskError();
     if (deny_write_type != DISK_ERROR_TYPE_NONE &&
         listLength(g_pserver->masters) == 0 &&
@@ -4932,11 +4970,14 @@ int processCommand(client *c, int callFlags) {
         return C_OK;
     }
 
+    // 如果当前实例存在关联的主库
     if (listLength(g_pserver->masters))
     {
         /* Only allow commands with flag "t", such as INFO, SLAVEOF and so on,
         * when replica-serve-stale-data is no and we are a replica with a broken
         * link with master. */
+       // 只有当副本服务陈旧数据为否，并且我们是一个与主服务器的链接断开的副本时，
+       // 才允许使用标记为“t”的命令，如INFO、SLAVEOF等。
         if (FBrokenLinkToMaster() &&
             g_pserver->repl_serve_stale_data == 0 &&
             is_denystale_command &&
@@ -4950,6 +4991,7 @@ int processCommand(client *c, int callFlags) {
 
     /* Loading DB? Return an error if the command has not the
      * CMD_LOADING flag. */
+    // 加载rdb期间，仅允许部分命令
     if (g_pserver->loading && is_denyloading_command) {
         /* Active Replicas can execute read only commands, and optionally write commands */
         if (!(g_pserver->loading == LOADING_REPLICATION && g_pserver->fActiveReplica && ((c->cmd->flags & CMD_READONLY) || g_pserver->fWriteDuringActiveLoad)))
@@ -7153,6 +7195,7 @@ uint64_t getMvccTstamp()
     return rval;
 }
 
+// 毫秒级的mvcc
 void incrementMvccTstamp()
 {
     uint64_t msPrev;
@@ -7179,6 +7222,9 @@ void OnTerminate()
         The easiest way to achieve that is to acutally segfault, so we assert
         here.
     */
+   // 任何未捕获的异常都将调用std：：terminate（）。
+   // 我们希望将其处理为segfault（打印堆栈跟踪等）。
+   // 实现这一点的最简单方法是实际分段故障，因此我们在这里断言。
     auto exception = std::current_exception();
     if (exception != nullptr)
     {
@@ -7214,6 +7260,7 @@ void wakeTimeThread() {
     serverAssert(sleeping_threads >= 0);
 }
 
+// TODO: 时间事件的相关处理逻辑，独立的线程
 void *timeThreadMain(void*) {
     timespec delay;
     delay.tv_sec = 0;
@@ -7252,9 +7299,11 @@ void *workerThreadMain(void *parg)
 {
     int iel = (int)((int64_t)parg);
     serverLog(LL_NOTICE, "Thread %d alive.", iel);
+    // serverTL 是线程间独立的变量
     serverTL = g_pserver->rgthreadvar+iel;  // set the TLS threadsafe global
     tlsInitThread();
 
+    // 非主线程初始化一些信息，开始监听端口（使用 reuseport ）等
     if (iel != IDX_EVENT_LOOP_MAIN)
     {
         aeThreadOnline();
@@ -7265,10 +7314,13 @@ void *workerThreadMain(void *parg)
     }
 
     moduleAcquireGIL(true); // Normally afterSleep acquires this, but that won't be called on the first run
+    // 获取读锁
     aeThreadOnline();
     aeEventLoop *el = g_pserver->rgthreadvar[iel].el;
+    // 尝试启动ae的io多路复用技术
     try
     {
+        // 每个线程一个独立的ae
         aeMain(el);
     }
     catch (ShutdownException)
@@ -7287,12 +7339,14 @@ static void validateConfiguration()
 {
     updateMasterAuth();
     
+    // 判断配置的线程是否超过可用硬件实现支持的并发线程数
     if (cserver.cthreads > (int)std::thread::hardware_concurrency()) {
         serverLog(LL_WARNING, "WARNING: server-threads is greater than this machine's core count.  Truncating to %u threads", std::thread::hardware_concurrency());
         cserver.cthreads = (int)std::thread::hardware_concurrency();
         cserver.cthreads = std::max(cserver.cthreads, 1);	// in case of any weird sign overflows
     }
 
+    // enable_multimaster 开启的时候，fActiveReplica 一定也要开启
     if (g_pserver->enable_multimaster && !g_pserver->fActiveReplica) {
         serverLog(LL_WARNING, "ERROR: Multi Master requires active replication to be enabled.");
         serverLog(LL_WARNING, "\tKeyDB will now exit.  Please update your configuration file.");
@@ -7344,12 +7398,17 @@ int main(int argc, char **argv) {
     int j;
     char config_from_stdin = 0;
 
+    // 安装一个终止处理程序
     std::set_terminate(OnTerminate);
 
     {
+    // 解析版本信息
     SymVer version;
     version = parseVersion(KEYDB_REAL_VERSION);
+    // 每个版本号要求都必须大于等于0
     serverAssert(version.major >= 0 && version.minor >= 0 && version.build >= 0);
+    // 要求版本必须相等，但是目前比较的都是 KEYDB_REAL_VERSION 
+    // 可能是后续考虑针对升级和降级的不同的处理逻辑
     serverAssert(compareVersion(&version) == VersionCompareResult::EqualVersion);
     }
 
@@ -7401,8 +7460,10 @@ int main(int argc, char **argv) {
 #ifdef INIT_SETPROCTITLE_REPLACEMENT
     spt_init(argc, argv);
 #endif
+    // 设置地域信息，时间相关
     setlocale(LC_COLLATE,"");
     tzset(); /* Populates 'timezone' global. */
+    // 设置oom处理句柄
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
     srandom(time(NULL)^getpid());
@@ -7418,17 +7479,20 @@ int main(int argc, char **argv) {
     
     serverAssert(g_pserver->repl_batch_offStart < 0);
 
+    // 获取随机hash种子
     uint8_t hashseed[16];
     getRandomHexChars((char*)hashseed,sizeof(hashseed));
     dictSetHashFunctionSeed(hashseed);
     g_pserver->sentinel_mode = checkForSentinelMode(argc,argv);
     initServerConfig();
     serverTL = &g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN];
+    // TODO: ?
     aeThreadOnline();
+    // main函数中此处会执行 g_lock.lock(tl_worker); 加锁行为
     aeAcquireLock();    // We own the lock on boot
     ACLInit(); /* The ACL subsystem must be initialized ASAP because the
                   basic networking code and client creation depends on it. */
-    moduleInitModulesSystem();
+    moduleInitModulesSystem(); // module的一些初始化
     tlsInit();
 
     /* Store the executable path and arguments in a safe place in order
@@ -7449,9 +7513,12 @@ int main(int argc, char **argv) {
     /* Check if we need to start in keydb-check-rdb/aof mode. We just execute
      * the program main. However the program is part of the Redis executable
      * so that we can easily execute an RDB check on loading errors. */
+    // 支持将redis-server改名为keydb-check-rdb来执行检查rdb的逻辑
+    // 也就是说 keydb-check-rdb 的bin文件完全就是redis-server的改名文件
     if (strstr(argv[0],"keydb-check-rdb") != NULL)
         redis_check_rdb_main(argc,(const char**)argv,NULL);
     else if (strstr(argv[0],"keydb-check-aof") != NULL)
+        // 也就是说 keydb-check-aof 的bin文件完全就是redis-server的改名文件
         redis_check_aof_main(argc,argv);
 
     if (argc >= 2) {
@@ -7537,6 +7604,7 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "Configuration loaded");
     }
 
+    // 校验集群的一些配置
     validateConfiguration();
 
     const char *err;
@@ -7546,14 +7614,19 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    // 初始化多线程，重中之重【重点】
     for (int iel = 0; iel < cserver.cthreads; ++iel)
     {
+        // 初始化的时候，第一个作为主线程存在
         initServerThread(g_pserver->rgthreadvar+iel, iel == IDX_EVENT_LOOP_MAIN);
     }
 
     initServerThread(&g_pserver->modulethreadvar, false);
     readOOMScoreAdj();
     initServer();
+
+    // 初始化网络【重中之重】
+    // 当使用多个工作线程的时候，需要利用到 reuseport 的特性
     initNetworking(cserver.cthreads > 1 /* fReusePort */);
 
     if (background || cserver.pidfile) createPidFile();
@@ -7561,6 +7634,7 @@ int main(int argc, char **argv) {
     redisAsciiArt();
     checkTcpBacklogSettings();
 
+    // 如果不是sentinel的模式
     if (!g_pserver->sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_WARNING,"Server initialized");
@@ -7588,6 +7662,7 @@ int main(int argc, char **argv) {
         ACLLoadUsersAtStartup();
 
         // special case of FUZZING load from stdin then quit
+        // 从标准输入中解析rdb数据，解析完成后就退出
         if (argc > 1 && strstr(argv[1],"rdbfuzz-mode") != NULL)
         {
             zmalloc_set_oom_handler(fuzzOutOfMemoryHandler);
@@ -7603,6 +7678,7 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         }
 
+        // 其中有创建异步worker队列的逻辑
         InitServerLast();
 
         try {
@@ -7658,24 +7734,33 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", g_pserver->maxmemory);
     }
 
+    // 设置cpu亲和性
     redisSetCpuAffinity(g_pserver->server_cpulist);
-    aeReleaseLock();    //Finally we can dump the lock
+    // main函数中此处会执行g_lock.unlock() 解锁行为
+    aeReleaseLock();    //Finally we can dump the lock 最后我们可以把锁卸了
     aeThreadOffline();
     moduleReleaseGIL(true);
     
     setOOMScoreAdj(-1);
     serverAssert(cserver.cthreads > 0 && cserver.cthreads <= MAX_EVENT_LOOPS);
 
+    // 创建了一个时间线程？作用是什么？
     pthread_create(&cserver.time_thread_id, nullptr, timeThreadMain, nullptr);
+    // 如果开启了时间线程优先的配置
     if (cserver.time_thread_priority) {
         struct sched_param time_thread_priority;
         time_thread_priority.sched_priority = sched_get_priority_max(SCHED_FIFO);
+        // 为线程指定调度策略
         pthread_setschedparam(cserver.time_thread_id, SCHED_FIFO, &time_thread_priority);
     }
 
+    // 在初始化一些worker线程之后，我们将创建的对应的worker线程
+    // TODO: 需要考虑的点是，多个worker线程在处理命令之后如何不冲突的变更本地内存的数据呢？
     pthread_attr_t tattr;
     pthread_attr_init(&tattr);
+    // 设置线程堆栈大小
     pthread_attr_setstacksize(&tattr, 1 << 23); // 8 MB
+    // 创建worker线程，【 重点关注 workerThreadMain 函数 】
     for (int iel = 0; iel < cserver.cthreads; ++iel)
     {
         pthread_create(g_pserver->rgthread + iel, &tattr, workerThreadMain, (void*)((int64_t)iel));
@@ -7703,6 +7788,7 @@ int main(int argc, char **argv) {
 
     /* The main thread sleeps until all the workers are done.
         this is so that all worker threads are orthogonal in their startup/shutdown */
+    // 主线程一直休眠，直到所有工作人员完成。这样，所有工作线程在启动/关闭时都是正交的
     void *pvRet;
     for (int iel = 0; iel < cserver.cthreads; ++iel)
         pthread_join(g_pserver->rgthread[iel], &pvRet);
@@ -7711,6 +7797,7 @@ int main(int argc, char **argv) {
     bool fLockAcquired = aeTryAcquireLock(false);
     g_pserver->shutdown_asap = true;    // flag that we're in shutdown
     if (!fLockAcquired)
+        // 我们实际上不会立即崩溃，因为我们想同步任何存储提供程序
         g_fInCrash = true;  // We don't actually crash right away, because we want to sync any storage providers
     
     saveMasterStatusToStorage(true);

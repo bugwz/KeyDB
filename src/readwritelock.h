@@ -11,10 +11,13 @@ class readWriteLock {
 public:
     readWriteLock(const char *name) : m_readLock(name), m_writeLock(name) {}
 
+    // 获得读
     void acquireRead() {
         std::unique_lock<fastlock> rm(m_readLock);
+        // 如果是main初始话的时候掉用，由于m_writeCount = 0，并且 m_writeWaiting = false
+        // 所以会直接 m_readCount++ 后返回
         while (m_writeCount > 0 || m_writeWaiting)
-            m_cv.wait(rm);
+            m_cv.wait(rm); // 当前线程阻塞等待其他线程通知
         m_readCount++;
     }
     
@@ -63,6 +66,7 @@ public:
     }
 
     void releaseRead() {
+        // 如果是初始化的时候掉用，直接m_readCount--后返回
         std::unique_lock<fastlock> rm(m_readLock);
         m_readCount--;
         m_cv.notify_all();

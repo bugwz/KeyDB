@@ -346,6 +346,8 @@ void queueLoadModule(sds path, sds *argv, int argc) {
 sds g_sdsProvider = nullptr;
 sds g_sdsArgs = nullptr;
 
+// 初始化存储服务
+// TODO: 具体的没怎么看
 bool initializeStorageProvider(const char **err)
 {
     try

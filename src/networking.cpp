@@ -1152,6 +1152,8 @@ int clientHasPendingReplies(client *c) {
 }
 
 static std::atomic<int> rgacceptsInFlight[MAX_EVENT_LOOPS];
+// 如果开启了主动的balance，那么在非集群模式下会选择一个最好的线程来处理请求
+// TODO: 如何计算的？？？
 int chooseBestThreadForAccept()
 {
     int ielMinLoad = 0;
@@ -1162,6 +1164,7 @@ int chooseBestThreadForAccept()
         atomicGet(g_pserver->rgthreadvar[iel].cclients, cclientsThread);
         cclientsThread += rgacceptsInFlight[iel].load(std::memory_order_relaxed);
         // Note: Its repl factor less one because cclients also includes replicas, so we don't want to double count
+        // 注意：它的repl因子小于1，因为cclient还包括副本，所以我们不想重复计算
         cclientsThread += (g_pserver->rgthreadvar[iel].cclientsReplica) * (g_pserver->replicaIsolationFactor-1);
         if (cclientsThread < cserver.thread_min_client_threshold)
             return iel;
@@ -1186,6 +1189,7 @@ void clientAcceptHandler(connection *conn) {
     }
 
     // Set thread affinity
+    // 线程亲和度
     if (cserver.fThreadAffinity)
         connSetThreadAffinity(conn, c->iel);
 
@@ -1226,12 +1230,15 @@ void clientAcceptHandler(connection *conn) {
             if (connWrite(c->conn,err,strlen(err)) == -1) {
                 /* Nothing to do, Just to avoid the warning... */
             }
+
+            // 由于这里又操作了全局变量，因此之前应该有加锁的操作
             g_pserver->stat_rejected_conn++;
             freeClientAsync(c);
             return;
         }
     }
 
+    // 由于这里又操作了全局变量，因此之前应该有加锁的操作
     g_pserver->stat_numconnections++;
     moduleFireServerEvent(REDISMODULE_EVENT_CLIENT_CHANGE,
                           REDISMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED,
@@ -1261,6 +1268,7 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip, int iel) 
      * Admission control will happen before a client is created and connAccept()
      * called, because we don't want to even start transport-level negotiation
      * if rejected. */
+    // 限制客户端连接的数量
     if (listLength(g_pserver->clients) + getClusterConnectionsCount()
         >= g_pserver->maxclients)
     {
@@ -1274,9 +1282,12 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip, int iel) 
         /* That's a best effort error message, don't check write errors.
          * Note that for TLS connections, no handshake was done yet so nothing
          * is written and the connection will just drop. */
+        // 客户端数量超限后回复错误
         if (connWrite(conn,err,strlen(err)) == -1) {
             /* Nothing to do, Just to avoid the warning... */
         }
+
+        // g_pserver->stat_rejected_conn 这个是全局变量，多线程操作会有冲突，应该前面有加锁的逻辑
         g_pserver->stat_rejected_conn++;
         connClose(conn);
         return;
@@ -1314,30 +1325,42 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip, int iel) 
     }
 }
 
+// 每个worker内部独立的处理连接的函数
+// TODO: 这里在处理的时候为什么会将本线程获取到的数据交给其他线程去处理
 void acceptOnThread(connection *conn, int flags, char *cip)
 {
     int ielCur = ielFromEventLoop(serverTL->el);
     bool fBootLoad = (g_pserver->loading == LOADING_BOOT);
 
     int ielTarget = ielCur;
+    // 如果处于加载数据的情况下，所有的请求都交给主线程处理
     if (fBootLoad)
     {
         ielTarget = IDX_EVENT_LOOP_MAIN;    // During load only the main thread is active
     }
+    // 如果处于测试情况下
     else if (g_fTestMode)
     {
         // On test mode we don't want any bunching of clients
+        // 在测试模式下，我们不希望出现任何客户端聚集的情况
+        // TODO: 难道测试的情况下有可能出现请求分布到线程中不均的情况吗？？？
         while (cserver.cthreads > 1 && ielTarget == IDX_EVENT_LOOP_MAIN)
+            // 随机选择一个目标线程
             ielTarget = rand() % cserver.cthreads;
     }
+    // 如果处于主动负载均衡client的情况下
     else if (g_pserver->active_client_balancing)
     {
         // Cluster connections are more transient, so its not worth the cost to balance
         //  we can trust that SO_REUSEPORT is doing its job of distributing connections
+        // 群集连接更为短暂，因此不值得付出代价来平衡，我们可以相信 SO_REUSEPORT 正在完成其分配连接的工作
         ielTarget = g_pserver->cluster_enabled ? ielCur : chooseBestThreadForAccept();
     }
 
+    // 筛选最优的线程事，会用到 rgacceptsInFlight ，这里做一个原子加1
     rgacceptsInFlight[ielTarget].fetch_add(1, std::memory_order_relaxed);
+
+    // 如果筛选出来的线程不是当前线程，比较的线程数组中的索引值
     if (ielTarget != ielCur)
     {
         char *szT = nullptr;
@@ -1349,21 +1372,28 @@ void acceptOnThread(connection *conn, int flags, char *cip)
         int res = aePostFunction(g_pserver->rgthreadvar[ielTarget].el, [conn, flags, ielTarget, szT] {
             connMarshalThread(conn);
             acceptCommonHandler(conn,flags,szT,ielTarget);
+             // 筛选最优的线程事，会用到 rgacceptsInFlight ，这里做一个原子减1
             rgacceptsInFlight[ielTarget].fetch_sub(1, std::memory_order_relaxed);
             zfree(szT);
         });
 
         if (res == AE_OK)
             return;
+        // 可以发现如果 res 失败的情况下，我们可以尝试使用本地的线程去处理对应请求
         // If res != AE_OK we can still try to accept on the local thread
     }
+
+     // 筛选最优的线程事，会用到 rgacceptsInFlight ，这里做一个原子减1
     rgacceptsInFlight[ielTarget].fetch_sub(1, std::memory_order_relaxed);
 
-    aeAcquireLock();
+    // TODO: 关于加锁解锁的逻辑有很多不解？？？
+    aeAcquireLock(); // 加锁
     acceptCommonHandler(conn,flags,cip,ielCur);
-    aeReleaseLock();
+    aeReleaseLock(); // 解锁
 }
 
+// TODO: 在多worker的情况下，这个表现的行为是什么？
+// 处理多连接
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];
@@ -1741,10 +1771,14 @@ void freeClientAsync(client *c) {
      * are in the context of the main thread while the other threads are
      * idle. */
     if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;  // check without the lock first
+    
+    // 细粒度的客户端的锁，变更客户端的信息
     std::lock_guard<decltype(c->lock)> clientlock(c->lock);
     if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;  // race condition after we acquire the lock
     c->flags |= CLIENT_CLOSE_ASAP;
     c->repl_down_since = g_pserver->unixtime;
+
+    // 由于 g_pserver->clients_to_close 是一个全局变量，因此多线程操作需要加锁
     std::unique_lock<fastlock> ul(g_lockasyncfree);
     listAddNodeTail(g_pserver->clients_to_close,c);
 }
@@ -2333,6 +2367,7 @@ int processMultibulkBuffer(client *c) {
         c->multibulklen = ll;
 
         /* Setup argv array on client structure */
+        // 在客户端结构上安装argv数组
         c->vecqueuedcmd.emplace_back(c->multibulklen);
     }
 
@@ -2491,6 +2526,8 @@ int processCommandAndResetClient(client *c, int flags) {
     int deadclient = 0;
     client *old_client = serverTL->current_client;
     serverTL->current_client = c;
+    
+    // 如果是异步执行的命令或者需要获取全局锁
     serverAssert((flags & CMD_CALL_ASYNC) || GlobalLocksAcquired());
     
     if (processCommand(c, flags) == C_OK) {
@@ -2614,13 +2651,21 @@ bool FAsyncCommand(parsed_command &cmd)
  * more query buffer to process, because we read more data from the socket
  * or because a client was blocked and later reactivated, so there could be
  * pending query buffer, already representing a full command, to process. */
+// 每次调用此函数时，在客户端结构“c”中，都会有更多的查询缓冲区要处理，
+// 因为我们从套接字读取了更多的数据，或者因为客户端被阻止并随后重新激活，
+// 所以可能会有挂起的查询缓冲区要处理，该缓冲区已经表示完整的命令。
 void processInputBuffer(client *c, bool fParse, int callFlags) {
     AssertCorrectThread(c);
     
+    // 需要解析querybuf中数据，将其转换成对应的指令
+    // 这里其实是为了在解析其他实例同步过来的原始命令，并尝试在本地执行
+    // TODO: 这里其实有一些可以进行数据优化的，原始命令的格式完全可以按照命令的格式进行处理
+    // 没必要转换成querybuf然后再次解析，执行replicaReplayCommand命令的时候其实已经解析过了
     if (fParse)
         parseClientCommandBuffer(c);
 
     /* Keep processing while there is something in the input buffer */
+    // 输入缓冲区中有内容时继续处理
     while (!c->vecqueuedcmd.empty()) {
         /* Return if we're still parsing this command */
         auto &cmd = c->vecqueuedcmd.front();
@@ -2672,11 +2717,14 @@ void readQueryFromClient(connection *conn) {
     
     AeLocker aelock;
     AssertCorrectThread(c);
+
+    // 对客户端加锁，客户端粒度的锁
     std::unique_lock<decltype(c->lock)> lock(c->lock, std::defer_lock);
     if (!lock.try_lock())
         return; // Process something else while we wait
 
     /* Update total number of reads on server */
+    // 原子变量使处理的的请求加1
     g_pserver->stat_total_reads_processed.fetch_add(1, std::memory_order_relaxed);
 
     readlen = PROTO_IOBUF_LEN;
@@ -2739,6 +2787,8 @@ void readQueryFromClient(connection *conn) {
         return;
     }
 
+    // 如果存在多个worker线程，或者 m_pstorageFactory 存在
+    // TODO: g_pserver->m_pstorageFactory 究竟指的是什么？
     if (cserver.cthreads > 1 || g_pserver->m_pstorageFactory) {
         parseClientCommandBuffer(c);
         if (g_pserver->enable_async_commands && !serverTL->disable_async_commands && listLength(g_pserver->monitors) == 0 && (aeLockContention() || serverTL->rgdbSnapshot[c->db->id] || g_fTestMode)) {

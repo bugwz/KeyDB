@@ -251,6 +251,16 @@ static int anetSetReuseAddr(char *err, int fd) {
     int yes = 1;
     /* Make sure connection-intensive things like the redis benchmark
      * will be able to close/open sockets a zillion of times */
+    // 确保像redis benchmark这样的连接密集型产品能够多次关闭/打开套接字
+    // SO_REUSEADDR 的作用：
+    //  1. 允许启动一个监听服务器并捆绑其众所周知端口，即使以前建立的将此端口用做他们的本地端口的连接仍存在。
+    //     这通常是重启监听服务器时出现，若不设置此选项，则bind时将出错
+    //  2. 允许在同一端口上启动同一服务器的多个实例，只要每个实例捆绑一个不同的本地IP地址即可。
+    //     对于TCP，我们根本不可能启动捆绑相同IP地址和相同端口号的多个服务器。
+    //  3. 允许单个进程捆绑同一端口到多个套接口上，只要每个捆绑指定不同的本地IP地址即可。
+    //     这一般不用于TCP服务器。
+    //  4. 允许完全重复的捆绑：当一个IP地址和端口绑定到某个套接口上时，还允许此IP地址和端口捆绑到另一个套接口上。
+    //     一般来说，这个特性仅在支持多播的系统上才有，而且只对UDP套接口而言（TCP不支持多播）。
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
         anetSetError(err, "setsockopt SO_REUSEADDR: %s", strerror(errno));
         return ANET_ERR;
@@ -261,6 +271,10 @@ static int anetSetReuseAddr(char *err, int fd) {
 static int anetSetReusePort(char *err, int fd) {
     int yes = 1;
     /* Let us load balance listen()s from multiple threads */
+    // 多线程listen，主要是为了抗负载
+    // SO_REUSEPORT 的作用：
+    //   1. 允许完全重复捆绑，仅在想捆绑相同IP地址和端口的套接口都指定了此套接口选项才行
+    //   2. 如果被捆绑的IP地址是一个多播地址，则SO_REUSEADDR和SO_REUSEPORT等效。
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) == -1) {
         anetSetError(err, "setsockopt SO_REUSEPORT: %s", strerror(errno));
         return ANET_ERR;
@@ -435,6 +449,7 @@ static int anetV6Only(char *err, int s) {
     return ANET_OK;
 }
 
+// 在多worker线程时，如果当前为主线程，则 fReusePort 为1， fFirstListen 为1
 static int _anetTcpServer(char *err, int port, const char *bindaddr, int af, int backlog, int fReusePort, int fFirstListen)
 {
     int s = -1, rv;
@@ -461,6 +476,7 @@ static int _anetTcpServer(char *err, int port, const char *bindaddr, int af, int
 
         if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
+        // TODO: fFirstListen 这里的作用是什么？
         if (fReusePort && !fFirstListen && anetSetReusePort(err,s) == ANET_ERR) goto error;
         if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) {
             s = ANET_ERR;

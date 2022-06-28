@@ -3,6 +3,7 @@
 
 AsyncWorkQueue::AsyncWorkQueue(int nthreads)
 {
+    // TODO: 没看懂实现逻辑？
     for (int i = 0; i < nthreads; ++i)
     {
         m_vecthreads.emplace_back([&]{

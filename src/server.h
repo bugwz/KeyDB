@@ -119,7 +119,7 @@ typedef long long ustime_t; /* microsecond time type. */
 
 #define FImplies(x, y) (!(x) || (y))
 
-#define LOADING_BOOT 1
+#define LOADING_BOOT 1 // TODO: 什么意思？
 #define LOADING_REPLICATION 2
 
 extern int g_fTestMode;
@@ -1693,7 +1693,7 @@ struct client {
     int iel; /* the event loop index we're registered with */
     struct fastlock lock {"client"};
     int master_error;
-    std::vector<parsed_command> vecqueuedcmd;
+    std::vector<parsed_command> vecqueuedcmd; // 记录了其他实例同步过来的原始命令内容
     int argc;
     robj **argv;
     size_t argv_len_sumActive = 0;
@@ -2198,7 +2198,10 @@ private:
     int rdb_key_save_delay = -1; // thread local cache
 };
 
+
 // Const vars are not changed after worker threads are launched
+// 启动工作线程后，不会更改常量变量
+// 因此keydb使用了一个全局的结构体来记录所有的变量的默认值，初始值等信息
 struct redisServerConst {
     pid_t pid;                  /* Main process pid. */
     time_t stat_starttime;          /* Server start time */
@@ -2208,7 +2211,7 @@ struct redisServerConst {
     char *executable;           /* Absolute executable file path. */
     char **exec_argv;           /* Executable argv vector (copy). */
 
-    int cthreads;               /* Number of main worker threads */
+    int cthreads;               /* Number of main worker threads */ // 工作的线程数
     int fThreadAffinity;        /* Should we pin threads to cores? */
     int threadAffinityOffset = 0; /* Where should we start pinning them? */
     char *pidfile;              /* PID file path */
@@ -2282,6 +2285,7 @@ struct redisServer {
 
 
     struct redisServerThreadVars rgthreadvar[MAX_EVENT_LOOPS];
+    // 模块线程要使用的服务器线程本地变量
     struct redisServerThreadVars modulethreadvar; /* Server thread local variables to be used by module threads */
     pthread_t rgthread[MAX_EVENT_LOOPS];
 
@@ -2675,7 +2679,7 @@ struct redisServer {
     //  Upper 44 bits: mstime (least significant 44-bits) enough for ~500 years before rollover from date of addition
     uint64_t mvcc_tstamp;
 
-    AsyncWorkQueue *asyncworkqueue;
+    AsyncWorkQueue *asyncworkqueue; // 异步任务处理队列
 
     /* System hardware info */
     size_t system_memory_size;  /* Total memory in system as reported by OS */
@@ -3911,6 +3915,7 @@ int populateCommandTableParseFlags(struct redisCommand *c, const char *strflags)
 
 int moduleGILAcquiredByModule(void);
 extern int g_fInCrash;
+// 在断言中使用，以验证是否正确获取了所有全局锁，以便服务器线程运行
 static inline int GlobalLocksAcquired(void)  // Used in asserts to verify all global locks are correctly acquired for a server-thread to operate
 {
     return aeThreadOwnsLock() || moduleGILAcquiredByModule() || g_fInCrash;
@@ -3942,6 +3947,8 @@ template<typename FN_PTR, class ...TARGS>
 void runAndPropogateToReplicas(FN_PTR *pfn, TARGS... args) {
     // Store the replication backlog starting params, we use this to know how much data was written.
     //  these are TLS in case we need to expand the buffer and therefore need to update them
+    // 存储复制backlog启动参数，我们使用它来了解写入了多少数据。
+    // 这些是TLS，以防我们需要扩展缓冲区，因此需要更新它们
     bool fNestedProcess = (g_pserver->repl_batch_idxStart >= 0);
     if (!fNestedProcess) {
         g_pserver->repl_batch_offStart = g_pserver->master_repl_offset;

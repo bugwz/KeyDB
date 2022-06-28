@@ -556,11 +556,15 @@ int canFeedReplicaReplBuffer(client *replica) {
  * the commands received by our clients in order to create the replication
  * stream. Instead if the instance is a replica and has sub-slaves attached,
  * we use replicationFeedSlavesFromMasterStream() */
+// 将主库的数据同步给从库
 void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) {
     int j;
+    // 在投喂数据时需要先获取一个全局锁
     serverAssert(GlobalLocksAcquired());
     serverAssert(g_pserver->repl_batch_offStart >= 0);
 
+    // 当新建从库的时候，如果还没有任何请求同步给从库的时候，如果主库需要发送一个ping操作给从库
+    // 由于ping操作需要使用slaveseldb 信息，因此此时dictid的值为-1
     if (dictid < 0)
         dictid = 0; // this can happen if we send a PING before any real operation
 
@@ -569,18 +573,26 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
      * propagate *identical* replication stream. In this way this replica can
      * advertise the same replication ID as the master (since it shares the
      * master replication history and has the same backlog and offsets). */
+    // 如果实例不是顶级主机，请尽快返回：我们将代理从主机接收的数据流，以便传播*相同*的复制流。
+    // 通过这种方式，此复制副本可以公布与主机相同的复制ID
+    // （因为它共享主机复制历史记录，并且具有相同的待办事项和偏移量）。
     if (!g_pserver->fActiveReplica && listLength(g_pserver->masters)) return;
 
     /* If there aren't slaves, and there is no backlog buffer to populate,
      * we can return ASAP. */
+    // 如果没有从库则直接返回就可以了
     if (g_pserver->repl_backlog == NULL && listLength(slaves) == 0) return;
 
     /* We can't have slaves attached and no backlog. */
+    // 没有backlog，但是却有从库，这种情况属于异常，应该assert
     serverAssert(!(listLength(slaves) != 0 && g_pserver->repl_backlog == NULL));
 
+    // 多主的模式下， fSendRaw = 0
+    // 单主的模式下， fSendRaw = 1
     bool fSendRaw = !g_pserver->fActiveReplica;
 
     /* Send SELECT command to every replica if needed. */
+    // 这里的逻辑与redis的逻辑一致
     if (g_pserver->replicaseldb != dictid) {
         char llstr[LONG_STR_SIZE];
         robj *selectcmd;
@@ -599,7 +611,11 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
         }
 
         /* Add the SELECT command into the backlog. */
+        // 将select命令添加到backlog中
         /* We don't do this for advanced replication because this will be done later when it adds the whole RREPLAY command */
+        // 我们不会对高级复制执行此操作，因为这将在稍后添加整个RREPLAY命令时执行
+        // 只有在单主的模式下，才会将select的命令放到backlog中
+        // TODO: 多主模式下select的处理逻辑？？？
         if (g_pserver->repl_backlog && fSendRaw) feedReplicationBacklogWithObject(selectcmd);
 
         if (dictid < 0 || dictid >= PROTO_SHARED_SELECT_CMDS)
@@ -610,6 +626,7 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
     /* Write the command to the replication backlog if any. */
     if (g_pserver->repl_backlog) 
     {
+        // 单主模式下，将对应的命令写入backlog中
         if (fSendRaw)
         {
             char aux[LONG_STR_SIZE+3];
@@ -638,20 +655,28 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
         }
         else
         {
+            // 多主的模式下
             char szDbNum[128];
             int cchDbNum = 0;
+            // TODO: 多主的模式下，这里为什么还要判断 fSendRaw ？？？
             if (!fSendRaw)
+                // TODO: 这里的操作是什么意思？
+                // TODO: 这里应该是生成对应db的resp协议，具体为什么要这么做？直接使用单主模式下的方式有什么问题？
                 cchDbNum = writeProtoNum(szDbNum, sizeof(szDbNum), dictid);
             
 
             char szMvcc[128];
             int cchMvcc = 0;
+            // 始终增加MVCC tstamp，以便与活动和正常复制保持一致
+            // TODO: MVCC的实现方式？以及具体的逻辑？
             incrementMvccTstamp();	// Always increment MVCC tstamp so we're consistent with active and normal replication
+             // TODO: 多主的模式下，这里为什么还要判断 fSendRaw ？？？
             if (!fSendRaw)
                 cchMvcc = writeProtoNum(szMvcc, sizeof(szMvcc), getMvccTstamp());
 
             //size_t cchlen = multilen+3;
             struct redisCommand *cmd = lookupCommand(szFromObj(argv[0]));
+            // 多主模式下，将需要传播的命令格式化，后面需要使用的时候直接使用就可以
             sds buf = catCommandForAofAndActiveReplication(sdsempty(), cmd, argv, argc);
             size_t cchlen = sdslen(buf);
 
@@ -660,6 +685,8 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
             static const char *protoRREPLAY = "*5\r\n$7\r\nRREPLAY\r\n$36\r\n00000000-0000-0000-0000-000000000000\r\n$";
             char proto[1024];
             int cchProto = 0;
+            // 多主模式下，需要在同步给从库的数据中添加一个header信息，用于标示数据来源于哪个master实例
+            // 从库在接受这些数据的时候可能会执行一些过滤的逻辑
             if (!fSendRaw)
             {
                 char uuid[37];
@@ -674,6 +701,8 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
             }
 
 
+            // 多主模式下，将数据写入backlog
+            // 需要注意，这些写入backlog中的数据中包含写入节点的uuid信息
             feedReplicationBacklog(proto, cchProto);            
             feedReplicationBacklog(buf, sdslen(buf));
 
@@ -687,6 +716,7 @@ void replicationFeedSlavesCore(list *slaves, int dictid, robj **argv, int argc) 
     }
 }
 
+// 主库需要将一些数据同步给从库
 void replicationFeedSlaves(list *replicas, int dictid, robj **argv, int argc) {
     runAndPropogateToReplicas(replicationFeedSlavesCore, replicas, dictid, argv, argc);
 }
@@ -3884,6 +3914,8 @@ void disconnectMaster(redisMaster *mi)
 /* Set replication to the specified master address and port. */
 struct redisMaster *replicationAddMaster(char *ip, int port) {
     // pre-reqs: We must not already have a replica in the list with the same tuple
+    // 检查一下是否存在相同的主库信息
+    // keydb中主库不只有一个，而是使用了一个list进行记录
     listIter li;
     listNode *ln;
     listRewind(g_pserver->masters, &li);
@@ -3895,29 +3927,40 @@ struct redisMaster *replicationAddMaster(char *ip, int port) {
     }
 
     // Pre-req satisfied, lets continue
+    // 如果当前没有主库信息，那当前实例的角色就是主库
     int was_master = listLength(g_pserver->masters) == 0;
     redisMaster *mi = nullptr;
+    // 并且在没有开启多主库的情况下，如果当前实例存在主库信息，那么它的主库数量一定是一个
+    // 这里的主从同步模型相当于redis原生的一主多从，数据复制流就只会从主库向从库
     if (!g_pserver->enable_multimaster && listLength(g_pserver->masters)) {
         serverAssert(listLength(g_pserver->masters) == 1);
         mi = (redisMaster*)listNodeValue(listFirst(g_pserver->masters));
     }
     else
     {
+        // 否则的话，相当于就是启用了多主的复制模型
+        // TODO: 需要注意的是 MALLOC_LOCAL 为0，这是zcalloc会返回一个nullptr值？？？
+        // 初始化主库信息后将其加入主库的同步列表中
         mi = (redisMaster*)zcalloc(sizeof(redisMaster), MALLOC_LOCAL);
         initMasterInfo(mi);
         listAddNodeTail(g_pserver->masters, mi);
     }
 
+    // 在单主模式下：由于重新设置了主库信息，因此需要与当前的主库断开连接，然后会重新连接新主库
+    // 在多主模式下：新加入的mi的masterhost默认都是nullptr
     sdsfree(mi->masterhost);
     mi->masterhost = nullptr;
     disconnectMaster(mi);
     serverAssert(mi->master == nullptr);
+
+    // 当处于单主模式下的时候，还需要断开block的客户端，由于从库连接新主之后，本地的数据有可能会发生变更
     if (!g_pserver->fActiveReplica)
         disconnectAllBlockedClients(); /* Clients blocked in master, now replica. */
 
     /* Setting masterhost only after the call to freeClient since it calls
      * replicationHandleMasterDisconnection which can trigger a re-connect
      * directly from within that call. */
+    // 记录master的ip和port信息，以便于后续当前实例连接新主库，在单主/多主模式都需要这么做
     mi->masterhost = sdsnew(ip);
     mi->masterport = port;
 
@@ -3926,6 +3969,7 @@ struct redisMaster *replicationAddMaster(char *ip, int port) {
 
     /* Force our slaves to resync with us as well. They may hopefully be able
      * to partially resync with us, but we can notify the replid change. */
+    // 在单主模式下，如果当前实例即将连接新主库，那么应该断开当前实例的所有从库
     if (!g_pserver->fActiveReplica)
         disconnectSlaves();
     cancelReplicationHandshake(mi,false);
@@ -3953,6 +3997,7 @@ struct redisMaster *replicationAddMaster(char *ip, int port) {
             mi->masterhost, mi->masterport);
         connectWithMaster(mi);
     }
+    // TODO: 记录元信息？
     saveMasterStatusToStorage(false);
     return mi;
 }
@@ -4136,6 +4181,7 @@ void replicaofCommand(client *c) {
     } else {
         long port;
 
+        // 如果客户端是从库，这相当于从库给主库发送了一个replicaof命令，这个操作应该被禁止掉。
         if (c->flags & CLIENT_SLAVE)
         {
             /* If a client is already a replica they cannot run this command,
@@ -4726,6 +4772,7 @@ void replicationCron(void) {
     listNode *lnMaster;
     listRewind(g_pserver->masters, &liMaster);
 
+    // TODO: fInMasterConnection 是啥意思？
     bool fInMasterConnection = false;
     while ((lnMaster = listNext(&liMaster)) && !fInMasterConnection)
     {
@@ -4735,12 +4782,15 @@ void replicationCron(void) {
         }
     }
 
+    // 遍历master列表，尝试与master建立连接
     bool fConnectionStarted = false;
     listRewind(g_pserver->masters, &liMaster);
     while ((lnMaster = listNext(&liMaster)))
     {
         redisMaster *mi = (redisMaster*)listNodeValue(lnMaster);
 
+        // std::unique_lock 实现了比std::lock_guard 更灵活的加解锁方式，但同时也带来了更大的
+        // 空间占用以及更慢的速度
         std::unique_lock<decltype(mi->master->lock)> ulock;
         if (mi->master != nullptr)
             ulock = decltype(ulock)(mi->master->lock);
@@ -4772,6 +4822,9 @@ void replicationCron(void) {
         }
 
         /* Check if we should connect to a MASTER */
+        // 通过使用 fInMasterConnection 来提供了一种更快的连接方式
+        // 每次只尝试去连接一个master，避免连接多个master带来的阻塞问题
+        // 将所有master的连接打散，避免单次 replicationCron 执行时间过长
         if (mi->repl_state == REPL_STATE_CONNECT && !fInMasterConnection && !g_pserver->loading && !g_pserver->FRdbSaveInProgress()) {
             serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
                 mi->masterhost, mi->masterport);
@@ -4788,6 +4841,10 @@ void replicationCron(void) {
             replicationSendAck(mi);
     }
 
+    // fConnectionStarted 参数的意义应该与 fInMasterConnection 相同，都是为了避免
+    // replicationCron 函数的单次执行时间过长
+    // 每次连接成功后，对主库链表进行一次变动，将第一个节点添加到最后一个，这样下一次遍历的
+    // 时候，直接操作第一个master节点即可，避免了list的不必要的遍历。
     if (fConnectionStarted) {
         // If we cancel this handshake we want the next attempt to be a different master
         listRotateHeadToTail(g_pserver->masters);
@@ -5328,6 +5385,7 @@ struct RemoteMasterState
 
 static std::unordered_map<std::string, RemoteMasterState> g_mapremote;
 
+// 所有主库发送给从库的数据都会进入该函数，对于从库来说需要额外处理一下对应的uuid，避免多主之间的循环同步
 void replicaReplayCommand(client *c)
 {
     if (s_pstate == nullptr)
@@ -5338,6 +5396,13 @@ void replicaReplayCommand(client *c)
     //  2: The raw command buffer to be replayed
     //  3: (OPTIONAL) the database ID the command should apply to
     
+
+    // rreplay 命令中会包含如下信息：
+    // 1. 来源实例的uuid
+    // 2. 原始命令的信息
+    // 3. （可选的）对应命令的dbid
+
+    // 如果对应的客户端不是当前实例的主库，直接报错
     if (!(c->flags & CLIENT_MASTER))
     {
         addReplyError(c, "Command must be sent from a master");
@@ -5346,6 +5411,7 @@ void replicaReplayCommand(client *c)
     }
 
     /* First Validate Arguments */
+    // 首先验证参数
     if (c->argc < 3)
     {
         addReplyError(c, "Invalid number of arguments");
@@ -5353,6 +5419,7 @@ void replicaReplayCommand(client *c)
         return;
     }
 
+    // 解析uuid的值
     std::string uuid;
     uuid.resize(UUID_BINARY_LEN);
     if (c->argv[1]->type != OBJ_STRING || sdslen((sds)ptrFromObj(c->argv[1])) != 36 
@@ -5392,13 +5459,18 @@ void replicaReplayCommand(client *c)
         }
     }
 
+    // 比较来源的uuid和当前实例的uuid
     if (FSameUuidNoNil((unsigned char*)uuid.data(), cserver.uuid))
     {
+        // 当主库发送过来的命令中的uuid和当前实例的uuid相同，则代表着这个命令是当前实例同步过去的
+        // 如果当前实例同步过去的数据，对端还会发送过来，这虽然不会导致数据回环复制，但是数据流量还是挺大的
+        // TODO: 我们自己的流量又发给自己了，这种情况有可能出现吗？
         addReply(c, shared.ok);
         s_pstate->Cancel();
         return; // Our own commands have come back to us.  Ignore them.
     }
 
+    // TODO: 啥意思？
     if (!s_pstate->FPush())
         return;
 
@@ -5457,13 +5529,31 @@ void replicaReplayCommand(client *c)
             if (sdslen(cFake->querybuf)) {
                 serverLog(LL_WARNING, "Closing connection to MASTER because of an unrecoverable protocol error");
                 freeClientAsync(c);
+                // 不要继续传输损坏的数据
                 fNoPropogate = true;    // don't keep transmitting corrupt data
             }
         }
     }
     serverTL->current_client = current_clientSave;
 
+    // TODO: 考虑一个问题：keydb的部署架构中，是否允许环型结构的存在？
+    // 在进行数据转发的时候场景比较特殊，当前对于每个节点来说，每个请求其实都会被转发至少2次
+    // 场景一：
+    // A，B，C三个节点相互通信，同步链路如下：
+    //   1. A写入了一个数据，这个数据会转发给B
+    //   2. B收到这个数据后，发现命令其中的uuid和自己不同，因此它又可能同步数据给A
+    //   3. A又收到来自于B转发自己的命令，发现与自己的uuid相同，不处理了
+    //
+    // 场景二：
+    // A，B，C三个节点相互通信，D节点之和B通信，同步链路如下：
+    //   1. A写入了一个数据，这个数据会转发给B
+    //   2. B收到这个数据后，发现命令其中的uuid和自己不同，因此它又可能同步数据给A和D
+    //   3.1 A又收到来自于B转发自己的命令，发现与自己的uuid相同，不处理了
+    //   3.2 D收到来自于B转发A的数据，处理后尝试转发给B
+    //       B收到来自于D的命令（初始来自于A），又会执行转发给D？？？这里是否会出现循环转发的问题？
+
     // call() will not propogate this for us, so we do so here
+    // call（）不会为我们传播这个，所以我们在这里这样做
     if (!s_pstate->FCancelled() && s_pstate->FFirst() && !cserver.multimaster_no_forward && !fNoPropogate)
         alsoPropagate(cserver.rreplayCommand,c->db->id,c->argv,c->argc,PROPAGATE_AOF|PROPAGATE_REPL);
     

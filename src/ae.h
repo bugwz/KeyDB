@@ -54,9 +54,9 @@ extern "C" {
                            loop iteration. Useful when you want to persist
                            things to disk before sending replies, and want
                            to do that in a group fashion. */
-#define AE_READ_THREADSAFE 8
-#define AE_WRITE_THREADSAFE 16
-#define AE_SLEEP_THREADSAFE 32
+#define AE_READ_THREADSAFE 8 // 线程安全读
+#define AE_WRITE_THREADSAFE 16 // 线程安全写
+#define AE_SLEEP_THREADSAFE 32 // 线程安全睡眠？？？睡眠还有线程安全的问题？
 
 #define AE_FILE_EVENTS (1<<0)
 #define AE_TIME_EVENTS (1<<1)

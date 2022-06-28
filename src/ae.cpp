@@ -86,8 +86,11 @@ public:
 mutex_wrapper g_lock;
 
 #else
+// 也是一个全局锁
+// TODO: 这个主要用于锁定 ae 消息？
 fastlock g_lock("AE (global)");
 #endif
+// 设置全局的读写锁
 readWriteLock g_forkLock("Fork (global)");
 thread_local aeEventLoop *g_eventLoopThisThread = NULL;
 
@@ -132,8 +135,10 @@ struct aeCommand
 static_assert(sizeof(aeCommand) <= PIPE_BUF, "aeCommand must be small enough to send atomically through a pipe");
 #endif
 
+// 多worker线程的场景下，该函数被用于处理ae的读写事件
 void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
 {
+    // TODO: 需要加锁？这个是一个全局锁嘛？
     std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
     aeCommand cmd;
     for (;;)
@@ -240,16 +245,22 @@ int aeCreateRemoteFileEvent(aeEventLoop *eventLoop, int fd, int mask,
 
 int aePostFunction(aeEventLoop *eventLoop, aePostFunctionProc *proc, void *arg)
 {
+    // 如果目标 eventLoop 是本地线程的，直接执行fn
     if (eventLoop == g_eventLoopThisThread)
     {
         proc(arg);
         return AE_OK;
     }
+
+    // 否则的话，需要创建一个cmd，并将其写给对应的 eventLoop
     aeCommand cmd = {};
     cmd.op = AE_ASYNC_OP::PostFunction;
     cmd.proc = proc;
     cmd.clientData = arg;
     cmd.fLock = true;
+
+    // eventLoop->fdCmdWrite 是一个管道的写端
+    // 对应的 eventLoop->fdCmdRead 是一个管道的读端
     auto size = write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
     if (size != sizeof(cmd))
         return AE_ERR;
@@ -258,12 +269,14 @@ int aePostFunction(aeEventLoop *eventLoop, aePostFunctionProc *proc, void *arg)
 
 int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fLock, bool fForceQueue)
 {
+    // 如果目标 eventLoop 是本地线程的，并且 fForceQueue 为 false 的情况下，直接执行fn
     if (eventLoop == g_eventLoopThisThread && !fForceQueue)
     {
         fn();
         return AE_OK;
     }
 
+    // 否则的话，需要创建一个cmd，并将其写给对应的 eventLoop
     aeCommand cmd = {};
     cmd.op = AE_ASYNC_OP::PostCppFunction;
     cmd.pfn = new std::function<void()>(fn);
@@ -314,6 +327,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     //fcntl(eventLoop->fdCmdWrite, F_SETFL, O_NONBLOCK);
     fcntl(eventLoop->fdCmdRead, F_SETFL, O_NONBLOCK);
     eventLoop->cevents = 0;
+    // 注册ae的读写回调函数为 aeProcessCmd
     aeCreateFileEvent(eventLoop, eventLoop->fdCmdRead, AE_READABLE|AE_READ_THREADSAFE, aeProcessCmd, NULL);
 
     return eventLoop;
@@ -603,8 +617,12 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     return processed;
 }
 
+// 每个worker线程内部处理事件的逻辑
 extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int mask, int fd)
 {
+
+// 上来先定一个锁的宏
+// TODO: 这是一个全局锁嘛？
 #define LOCK_IF_NECESSARY(fe, tsmask) \
     std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock); \
     if (!(fe->mask & tsmask)) { \
@@ -635,6 +653,7 @@ extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int ma
         * Fire the readable event if the call sequence is not
         * inverted. */
     if (!invert && fe->mask & mask & AE_READABLE) {
+        // 可读事件发生
         LOCK_IF_NECESSARY(fe, AE_READ_THREADSAFE);
         fe->rfileProc(eventLoop,fd,fe->clientData,mask | (fe->mask & AE_READ_THREADSAFE));
         fired++;
@@ -680,6 +699,7 @@ extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int ma
  * The function returns the number of events processed. */
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
+    // 其中 g_eventLoopThisThread 也是一个线程本地的变量
     serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     int processed = 0, numevents;
 
@@ -733,6 +753,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 
         /* Call the multiplexing API, will return only on timeout or when
          * some event fires. */
+        // 掉用io多路复用的api，将会在超时或者有可处理事件的时候返回
         numevents = aeApiPoll(eventLoop, tvp);
 
         /* After sleep callback. */
@@ -790,8 +811,12 @@ void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     g_eventLoopThisThread = eventLoop;
     while (!eventLoop->stop) {
+        // 我们应该在处理后放弃它
         serverAssert(!aeThreadOwnsLock()); // we should have relinquished it after processing
+
         aeProcessEvents(eventLoop, AE_ALL_EVENTS|AE_CALL_BEFORE_SLEEP|AE_CALL_AFTER_SLEEP);
+
+        // 我们应该在处理后放弃它
         serverAssert(!aeThreadOwnsLock()); // we should have relinquished it after processing
     }
 }
@@ -822,10 +847,12 @@ void aeThreadOnline()
     g_forkLock.acquireRead();
 }
 
+// TODO: 这里有很多不解，下面的加锁解锁是什么意思？
 void aeAcquireLock()
 {
     g_forkLock.releaseRead();
     g_lock.lock(tl_worker);
+    // TODO: 又开始阻塞等待读？
     g_forkLock.acquireRead();
 }
 

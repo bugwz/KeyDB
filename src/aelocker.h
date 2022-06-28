@@ -9,6 +9,7 @@ public:
     {
     }
 
+    // 如果传递了客户端，则该客户端已被锁定
     void arm(client *c = nullptr, bool fIfNeeded = false) // if a client is passed, then the client is already locked
     {
         if (m_fArmed)
